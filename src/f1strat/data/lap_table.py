@@ -24,7 +24,7 @@ POSITION_COLUMNS = [
 ]
 LAP_TABLE_COLUMNS = [
     "season", "round", "circuit", "session_type", "driver", "team", "lap_number",
-    "lap_time_s", "sector1_s", "sector2_s", "sector3_s", "lap_end_time_s", "is_accurate",
+    "lap_time_s", "sector1_s", "sector2_s", "sector3_s", "lap_end_time_s", "is_accurate", "is_deleted",
     "compound", "tyre_age", "fresh_tyre", "stint", "compounds_used_so_far",
     "is_pit_in_lap", "is_pit_out_lap", "pit_lane_time_s", "track_status",
     "is_sc", "is_vsc", "is_yellow", "is_red_flag", "is_restart_lap", "is_clean_lap",
