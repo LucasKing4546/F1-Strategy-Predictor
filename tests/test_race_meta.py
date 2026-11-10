@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from f1strat.data.race_meta import GRID_COLUMNS, RACE_META_COLUMNS, build_grid, build_race_meta
+from f1strat.data.race_meta import GRID_COLUMNS, RACE_META_COLUMNS, build_grid, build_race_meta, rain_slowdown
 
 LAP_S = 100.0
 
@@ -31,7 +31,7 @@ def _weather(samples):
     )
 
 
-def _meta(laps, weather, scheduled_laps=3):
+def _meta(laps, weather, scheduled_laps=3, rain_slowdown_s=0.0):
     return build_race_meta(
         _laps(laps),
         _weather(weather),
@@ -41,6 +41,7 @@ def _meta(laps, weather, scheduled_laps=3):
         circuit="Zandvoort",
         event_format="sprint_qualifying",
         scheduled_laps=scheduled_laps,
+        rain_slowdown_s=rain_slowdown_s,
     )
 
 
@@ -61,12 +62,26 @@ def test_dry_race():
     assert (row["event_name"], row["event_format"]) == ("Dutch Grand Prix", "sprint_qualifying")
     assert (row["scheduled_laps"], row["completed_laps"]) == (3, 3)
     assert (row["has_rainfall"], row["wet_tyre_laps"], row["is_wet"]) == (False, 0, False)
+    assert row["rain_slowdown_s"] == 0.0
 
 
-def test_rainfall_during_the_race_makes_it_wet():
-    row = _meta(DRY, [(50, False), (150, True)]).iloc[0]
+def test_rain_that_slows_the_laps_makes_the_race_wet():
+    row = _meta(DRY, [(50, False), (150, True)], rain_slowdown_s=2.2).iloc[0]
 
     assert row["has_rainfall"]
+    assert row["is_wet"]
+
+
+def test_rain_that_does_not_slow_the_laps_keeps_the_race_dry():
+    row = _meta(DRY, [(50, False), (150, True)], rain_slowdown_s=0.2).iloc[0]
+
+    assert row["has_rainfall"]
+    assert not row["is_wet"]
+
+
+def test_rain_with_unmeasurable_effect_makes_the_race_wet():
+    row = _meta(DRY, [(50, False), (150, True)], rain_slowdown_s=np.nan).iloc[0]
+
     assert row["is_wet"]
 
 
@@ -142,3 +157,32 @@ def test_driver_with_laps_but_no_grid_position_raises(bbb_result):
 
     with pytest.raises(ValueError, match="BBB"):
         build_grid(results, laps, season=2026, round_number=12)
+
+
+def _clean_laps(deltas, rain_laps, clean=None):
+    laps = range(1, len(deltas) + 1)
+    return pd.DataFrame(
+        {
+            "lap_number": list(laps),
+            "rainfall": pd.array([lap in rain_laps for lap in laps], dtype="boolean"),
+            "is_clean_lap": [True] * len(deltas) if clean is None else clean,
+            "lap_delta_s": deltas,
+        }
+    )
+
+
+def test_rain_slowdown_compares_rain_laps_with_nearby_dry_laps():
+    deltas = [5.0] + [0.0] * 6 + [2.0, 2.5] + [0.0] * 6 + [9.0]
+    table = _clean_laps(deltas, rain_laps={8, 9})
+
+    assert rain_slowdown(table) == pytest.approx(2.25)
+
+
+def test_no_rain_laps_means_no_slowdown():
+    assert rain_slowdown(_clean_laps([0.0] * 5, rain_laps=set())) == 0.0
+
+
+def test_rain_only_on_unclean_laps_cannot_be_measured():
+    table = _clean_laps([0.0] * 5, rain_laps={3}, clean=[True, True, False, True, True])
+
+    assert np.isnan(rain_slowdown(table))

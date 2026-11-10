@@ -3,11 +3,15 @@ import pandas as pd
 from fastf1.core import Session
 from fastf1.events import Event
 
+from f1strat.data.lap_table import race_lap_table
+
 WET_COMPOUNDS = ("INTERMEDIATE", "WET")
 PIT_LANE_GRID = 0
+RAIN_SLOWDOWN_S = 1.0
+RAIN_WINDOW_LAPS = 5
 RACE_META_COLUMNS = [
-    "season", "round", "event_name", "circuit", "event_format",
-    "scheduled_laps", "completed_laps", "has_rainfall", "wet_tyre_laps", "is_wet",
+    "season", "round", "event_name", "circuit", "event_format", "scheduled_laps", "completed_laps",
+    "has_rainfall", "wet_tyre_laps", "rain_slowdown_s", "is_wet",
 ]
 GRID_COLUMNS = [
     "season", "round", "driver", "team", "grid_position", "is_pit_lane_start", "finish_position", "status",
@@ -21,6 +25,19 @@ def _race_rainfall(laps: pd.DataFrame, weather: pd.DataFrame) -> pd.Series:
     return weather.loc[during, "Rainfall"]
 
 
+def rain_slowdown(table: pd.DataFrame) -> float:
+    rain_laps = set(table.loc[table["rainfall"].fillna(False).astype(bool), "lap_number"])
+    if not rain_laps:
+        return 0.0
+    nearby = {lap for rain in rain_laps for lap in range(rain - RAIN_WINDOW_LAPS, rain + RAIN_WINDOW_LAPS + 1)}
+    clean = table[table["is_clean_lap"]]
+    rain = clean.loc[clean["lap_number"].isin(rain_laps), "lap_delta_s"]
+    dry = clean.loc[clean["lap_number"].isin(nearby - rain_laps), "lap_delta_s"]
+    if rain.empty or dry.empty:
+        return float("nan")
+    return float(rain.median() - dry.median())
+
+
 def build_race_meta(
     laps: pd.DataFrame,
     weather: pd.DataFrame,
@@ -30,6 +47,7 @@ def build_race_meta(
     circuit: str,
     event_format: str,
     scheduled_laps: int,
+    rain_slowdown_s: float,
 ) -> pd.DataFrame:
     if laps.empty:
         raise ValueError("laps is empty; load the session with laps=True")
@@ -38,6 +56,7 @@ def build_race_meta(
         raise ValueError("Rainfall is missing during the race")
     has_rainfall = bool(rainfall.astype(bool).any())
     wet_tyre_laps = int(laps["Compound"].isin(WET_COMPOUNDS).sum())
+    rain_slows_laps = pd.isna(rain_slowdown_s) or rain_slowdown_s > RAIN_SLOWDOWN_S
     row = {
         "season": season,
         "round": round_number,
@@ -48,7 +67,8 @@ def build_race_meta(
         "completed_laps": int(laps["LapNumber"].max()),
         "has_rainfall": has_rainfall,
         "wet_tyre_laps": wet_tyre_laps,
-        "is_wet": has_rainfall or wet_tyre_laps > 0,
+        "rain_slowdown_s": rain_slowdown_s,
+        "is_wet": wet_tyre_laps > 0 or (has_rainfall and rain_slows_laps),
     }
     return pd.DataFrame([row], columns=RACE_META_COLUMNS)
 
@@ -93,6 +113,7 @@ def race_meta(year: int, event_name: str) -> pd.DataFrame:
         circuit=event["Location"],
         event_format=event["EventFormat"],
         scheduled_laps=session.total_laps,
+        rain_slowdown_s=rain_slowdown(race_lap_table(year, event_name)),
     )
 
 
