@@ -5,6 +5,7 @@ import pytest
 from f1strat.data.lap_table import build_lap_table
 
 STATUS = {3: "26", 6: "4"}
+NO_EVENTS = pd.DataFrame(columns=["event_type", "start_time_s", "end_time_s"])
 
 
 def _rows(driver, times, compounds):
@@ -21,6 +22,7 @@ def _rows(driver, times, compounds):
                 "LapNumber": float(lap),
                 "LapTime": pd.to_timedelta(time_s, unit="s"),
                 "Time": pd.to_timedelta(end, unit="s"),
+                "LapStartTime": pd.to_timedelta(end - time_s, unit="s"),
                 "Sector1Time": pd.to_timedelta(time_s / 3, unit="s"),
                 "Sector2Time": pd.to_timedelta(time_s / 3, unit="s"),
                 "Sector3Time": pd.to_timedelta(time_s / 3, unit="s"),
@@ -36,14 +38,19 @@ def _rows(driver, times, compounds):
     return rows
 
 
+def _with_pit_times(rows):
+    laps = pd.DataFrame(rows)
+    for column in ("PitInTime", "PitOutTime"):
+        laps[column] = pd.Series(pd.NaT, index=laps.index, dtype="timedelta64[ns]")
+    return laps
+
+
 def _race():
-    laps = pd.DataFrame(
+    laps = _with_pit_times(
         _rows("AAA", [95, 90, 90, 90, 99, 120, 92, 90], ["MEDIUM"] * 8)
         + _rows("BBB", [96, 90, 90, 112, 110, 115, 91, 89], ["MEDIUM"] * 4 + ["HARD"] * 4)
         + _rows("CCC", [100, 110, 110, 110, 110, 130, 110], ["SOFT"] * 7)
     )
-    for column in ("PitInTime", "PitOutTime"):
-        laps[column] = pd.Series(pd.NaT, index=laps.index, dtype="timedelta64[ns]")
     bbb = laps["Driver"] == "BBB"
     laps.loc[bbb & (laps["LapNumber"] == 4), "PitInTime"] = pd.Timedelta(seconds=380)
     laps.loc[bbb & (laps["LapNumber"] == 5), "PitOutTime"] = pd.Timedelta(seconds=402)
@@ -68,7 +75,7 @@ def _weather():
 
 
 def _table():
-    return build_lap_table(_race(), _weather(), season=2025, round_number=14, circuit="Budapest")
+    return build_lap_table(_race(), _weather(), season=2025, round_number=14, circuit="Budapest", events=NO_EVENTS)
 
 
 def _row(table, driver, lap):
@@ -179,18 +186,18 @@ def test_duplicate_driver_lap_raises():
     laps = _race()
 
     with pytest.raises(ValueError, match="duplicate"):
-        build_lap_table(pd.concat([laps, laps.iloc[[0]]]), _weather(), season=2025, round_number=14, circuit="Budapest")
+        build_lap_table(pd.concat([laps, laps.iloc[[0]]]), _weather(), season=2025, round_number=14, circuit="Budapest", events=NO_EVENTS)
 
 
 def test_missing_deleted_flags_raise():
     with pytest.raises(ValueError, match="Deleted"):
-        build_lap_table(_race().assign(Deleted=None), _weather(), season=2025, round_number=14, circuit="Budapest")
+        build_lap_table(_race().assign(Deleted=None), _weather(), season=2025, round_number=14, circuit="Budapest", events=NO_EVENTS)
 
 
 def test_input_order_does_not_change_output():
     shuffled = _race().sample(frac=1, random_state=0)
 
-    table = build_lap_table(shuffled, _weather(), season=2025, round_number=14, circuit="Budapest")
+    table = build_lap_table(shuffled, _weather(), season=2025, round_number=14, circuit="Budapest", events=NO_EVENTS)
 
     pd.testing.assert_frame_equal(table, _table())
 
@@ -199,10 +206,43 @@ def test_lap_after_missing_lap_is_not_a_restart():
     laps = _race()
     laps = laps[~((laps["Driver"] == "AAA") & (laps["LapNumber"] == 7))]
 
-    table = build_lap_table(laps, _weather(), season=2025, round_number=14, circuit="Budapest")
+    table = build_lap_table(laps, _weather(), season=2025, round_number=14, circuit="Budapest", events=NO_EVENTS)
 
     assert not _row(table, "AAA", 8)["is_restart_lap"]
 
 
 def test_rainfall_stays_boolean_with_untimed_laps():
     assert _table()["rainfall"].dtype == "boolean"
+
+
+def test_red_flag_comes_from_events_by_time():
+    laps = _with_pit_times(
+        _rows("AAA", [90, 90, 120, 2000, 170, 90], ["MEDIUM"] * 6)
+        + _rows("ZZZ", [200, 100, 2100, 170, 95], ["MEDIUM"] * 5)
+    )
+    laps["TrackStatus"] = "1"
+    laps.loc[(laps["Driver"] == "AAA") & (laps["LapNumber"] == 3), "TrackStatus"] = "15"
+    laps.loc[(laps["Driver"] == "ZZZ") & (laps["LapNumber"] == 2), "TrackStatus"] = "15"
+    suspended = ((laps["Driver"] == "AAA") & laps["LapNumber"].isin([4, 5])) | (
+        (laps["Driver"] == "ZZZ") & laps["LapNumber"].isin([3, 4])
+    )
+    laps.loc[suspended, "LapTime"] = pd.NaT
+    events = pd.DataFrame({"event_type": ["RED"], "start_time_s": [250.0], "end_time_s": [2470.0]})
+
+    table = build_lap_table(laps, _weather(), season=2026, round_number=16, circuit="Monza", events=events)
+
+    red = table[table["is_red_flag"]].groupby("driver")["lap_number"].apply(list).to_dict()
+    restart = table[table["is_restart_lap"]].groupby("driver")["lap_number"].apply(list).to_dict()
+    assert red == {"AAA": [3, 4, 5], "ZZZ": [2, 3, 4]}
+    assert restart == {"AAA": [6], "ZZZ": [5]}
+
+
+def test_red_flag_lap_from_events_is_not_clean():
+    laps = _with_pit_times(_rows("AAA", [90, 90, 90, 92, 90, 90], ["MEDIUM"] * 6))
+    laps["TrackStatus"] = "1"
+    events = pd.DataFrame({"event_type": ["RED"], "start_time_s": [280.0], "end_time_s": [350.0]})
+
+    table = build_lap_table(laps, _weather(), season=2026, round_number=16, circuit="Monza", events=events)
+
+    assert _row(table, "AAA", 4)["is_red_flag"]
+    assert table.loc[table["is_clean_lap"], "lap_number"].tolist() == [2, 3, 6]

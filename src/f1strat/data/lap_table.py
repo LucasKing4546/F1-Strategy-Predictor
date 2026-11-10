@@ -1,6 +1,7 @@
 import fastf1
 import pandas as pd
 
+from f1strat.data.events import build_events
 from f1strat.data.long_runs import DRY_COMPOUNDS
 
 KNOWN_COMPOUNDS = DRY_COMPOUNDS + ("INTERMEDIATE", "WET")
@@ -61,6 +62,7 @@ def _base(laps: pd.DataFrame) -> pd.DataFrame:
             "sector1_s": _seconds(laps["Sector1Time"]),
             "sector2_s": _seconds(laps["Sector2Time"]),
             "sector3_s": _seconds(laps["Sector3Time"]),
+            "lap_start_time_s": _seconds(laps["LapStartTime"]),
             "lap_end_time_s": _seconds(laps["Time"]),
             "is_accurate": laps["IsAccurate"].eq(True),
             "is_deleted": laps["Deleted"].eq(True),
@@ -77,10 +79,17 @@ def _base(laps: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _add_flags(table: pd.DataFrame) -> pd.DataFrame:
+def _in_red_flag(table: pd.DataFrame, events: pd.DataFrame) -> pd.Series:
+    in_red = pd.Series(False, index=table.index)
+    for red in events[events["event_type"] == "RED"].itertuples():
+        in_red |= (table["lap_start_time_s"] < red.end_time_s) & (table["lap_end_time_s"] > red.start_time_s)
+    return in_red
+
+
+def _add_flags(table: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     status = table["track_status"]
     is_sc = status.str.contains("4")
-    is_red_flag = status.str.contains("5")
+    is_red_flag = status.str.contains("5") | _in_red_flag(table, events)
     neutralised = is_sc | is_red_flag
     previous_is_consecutive = table.groupby("driver")["lap_number"].diff() == 1
     previous_neutralised = neutralised.groupby(table["driver"]).shift(fill_value=False) & previous_is_consecutive
@@ -139,6 +148,7 @@ def _add_weather(table: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
 def _add_clean_and_pace(table: pd.DataFrame) -> pd.DataFrame:
     candidate = (
         table["track_status"].eq(GREEN)
+        & ~table["is_red_flag"]
         & ~table["is_pit_in_lap"]
         & ~table["is_pit_out_lap"]
         & table["is_accurate"]
@@ -161,9 +171,10 @@ def build_lap_table(
     season: int,
     round_number: int,
     circuit: str,
+    events: pd.DataFrame,
     session_type: str = "R",
 ) -> pd.DataFrame:
-    table = _add_flags(_base(laps))
+    table = _add_flags(_base(laps), events)
     table = _add_positions(table)
     table = _add_progress(table)
     table = _add_weather(table, weather)
@@ -176,10 +187,13 @@ def race_lap_table(year: int, event_name: str) -> pd.DataFrame:
     event = fastf1.get_event(year, event_name)
     session = event.get_session("Race")
     session.load(telemetry=False, messages=True)
+    round_number = int(event["RoundNumber"])
+    events = build_events(session.track_status, session.race_control_messages, session.laps, year, round_number)
     return build_lap_table(
         session.laps,
         session.weather_data,
         season=year,
-        round_number=int(event["RoundNumber"]),
+        round_number=round_number,
         circuit=event["Location"],
+        events=events,
     )
